@@ -11,17 +11,9 @@ app.use(express.json());
 
 // El logo es una copia local (no se lee del public/ de admin-frontend —
 // print-server es un paquete aparte que puede correr en una máquina
-// distinta, ver punto 32 de CLAUDE.md). Se redimensiona/prepara UNA sola
-// vez al arrancar (no en cada impresión): la imagen original es a color y
-// de alta resolución (815x614, pensada para pantalla), muy por encima de
-// lo que una impresora térmica puede/necesita imprimir — se reduce a un
-// ancho fijo de 384px (seguro tanto para papel de 58mm como de 80mm) y se
-// convierte a escala de grises con más contraste, para que el
-// medio-tono/dithering que hace @node-escpos/core al imprimir se vea
-// nítido en papel térmico (blanco y negro puro), no borroso. El mismo
-// buffer procesado se reutiliza para /print-receipt (convertido a Image
-// de @node-escpos/core) y para /preview-receipt (como data URI en el
-// <img> del HTML) — no se procesa dos veces.
+// distinta). Se redimensiona/prepara UNA sola vez al arrancar:
+// se reduce a un ancho fijo de 384px y se convierte a escala de grises con
+// alto contraste para nitidez en papel térmico.
 const LOGO_PATH = path.join(__dirname, "assets", "logo.png");
 const LOGO_PRINT_WIDTH = 384;
 
@@ -45,13 +37,10 @@ function getLogoAssets() {
   }
   return logoAssetsPromise;
 }
-// Se prepara apenas arranca el servidor, no en la primera impresión —
-// así el primer recibo del día no espera el procesamiento de la imagen.
+
 getLogoAssets();
 
-// Anchos de columna compartidos entre la impresión real (tableCustom) y
-// la vista previa en HTML (flexbox) — si cambias una proporción, cambia
-// la otra, o la vista previa deja de reflejar lo que se imprime.
+// Anchos de columna compartidos entre la impresión real (tableCustom) y la vista previa en HTML.
 const TWO_COL_WIDTHS = [0.5, 0.5];
 const ITEM_COL_WIDTHS = [0.4, 0.15, 0.2, 0.25];
 
@@ -59,11 +48,6 @@ function money(n) {
   return `$${Number(n).toLocaleString("es-CO")}`;
 }
 
-// El negocio es 100% en Colombia — la fecha/hora del ticket debe verse en
-// Bogotá sin importar el reloj/zona horaria configurado en la máquina
-// física donde corre este servidor (que puede no estar bien configurado,
-// a diferencia de un servidor en la nube). `timeZone` explícito evita
-// depender de eso.
 const COLOMBIA_TIME_ZONE = "America/Bogota";
 function formatBogotaDateTime(date) {
   return date.toLocaleString("es-CO", { timeZone: COLOMBIA_TIME_ZONE });
@@ -71,17 +55,7 @@ function formatBogotaDateTime(date) {
 
 /**
  * POST /print-receipt
- * Recibe un recibo ya armado (branch/branchAddress/branchPhone/invoiceId/
- * items/subtotal/tax/total/cashier/paymentMethod — ver PrintReceiptPayload
- * en printerService.ts, duplicado en admin-frontend/src/services/ y
- * src/cajero/services/) y lo manda a la impresora térmica USB conectada a
- * ESTA máquina física. El formato imita EXACTAMENTE al recibo en pantalla
- * (SaleReceipt.tsx): logo, "Mecatos el Santi", datos de la sede, ticket/
- * fecha, cajero/método de pago, tabla de ítems con encabezado
- * (Producto/Cant./Precio/Subtotal), subtotal/impuesto/total, y el aviso de
- * DIAN. No hay cola ni reintento: si la impresora no responde, se
- * devuelve un error 500 y el frontend cae de vuelta a window.print() —
- * ver docs/THERMAL_PRINTER_INTEGRATION.md para el diseño completo.
+ * Manda el recibo a la impresora térmica USB conectada a esta máquina.
  */
 app.post("/print-receipt", async (req, res) => {
   const {
@@ -89,7 +63,7 @@ app.post("/print-receipt", async (req, res) => {
     branchAddress,
     branchPhone,
     invoiceId,
-    items,
+    items = [],
     subtotal,
     tax,
     total,
@@ -99,10 +73,6 @@ app.post("/print-receipt", async (req, res) => {
 
   let device;
   try {
-    // Autodetecta la primera impresora USB conectada. Si hay más de un
-    // dispositivo USB de tipo impresora en la máquina, usa
-    // `new USBAdapter(vid, pid)` con el vendor/product id específico —
-    // ver README.md de este paquete para cómo encontrarlos.
     device = new USBAdapter();
   } catch (err) {
     console.error("Printer detection error:", err);
@@ -114,12 +84,17 @@ app.post("/print-receipt", async (req, res) => {
       device.open((err) => (err ? reject(err) : resolve(undefined)));
     });
 
-    const printer = new Printer(device, {});
+    // 1. CODIFICACIÓN EN ESPAÑOL (PC850 / Latin-1)
+    // Permite imprimir tildes, eñes y signos como "¡" sin caracteres raros.
+    const printerOptions = {
+      encoding: "850",
+    };
+    const printer = new Printer(device, printerOptions);
 
-    // Encabezado: logo + nombre + datos de la sede — mismo orden que
-    // SaleReceipt.tsx en pantalla. Si el logo no se pudo preparar
-    // (ver getLogoAssets), se sigue sin él en vez de fallar todo el
-    // recibo.
+    // Recompone el estado de hardware de la impresora
+    printer.hardware("init");
+
+    // Encabezado: Logo + Nombre + Datos de la sede
     printer.align("ct");
     const { escposImage } = await getLogoAssets();
     if (escposImage) {
@@ -136,8 +111,7 @@ app.post("/print-receipt", async (req, res) => {
       .text(branchPhone || "")
       .text("================================");
 
-    // Ticket/fecha y cajero/método de pago en dos columnas — igual que
-    // los `flex justify-between` del recibo en pantalla.
+    // Datos del Ticket y Cajero
     printer.align("lt");
     printer.tableCustom([
       { text: `Ticket: ${invoiceId}`, align: "LEFT", width: TWO_COL_WIDTHS[0] },
@@ -149,8 +123,7 @@ app.post("/print-receipt", async (req, res) => {
     ]);
     printer.text("================================");
 
-    // Tabla de ítems CON encabezado — mismas 4 columnas que la tabla en
-    // pantalla (Producto/Cant./Precio/Subtotal), no solo 2.
+    // Tabla de Ítems
     printer.tableCustom([
       { text: "Producto", align: "LEFT", width: ITEM_COL_WIDTHS[0] },
       { text: "Cant.", align: "RIGHT", width: ITEM_COL_WIDTHS[1] },
@@ -166,6 +139,7 @@ app.post("/print-receipt", async (req, res) => {
       ]);
     });
 
+    // Totales
     printer.text("--------------------------------");
     printer.tableCustom([
       { text: "Subtotal", align: "LEFT", width: TWO_COL_WIDTHS[0] },
@@ -182,17 +156,17 @@ app.post("/print-receipt", async (req, res) => {
     ]);
     printer.style("normal");
 
+    // Mensaje Final, Avance de Papel y Corte
     printer
       .align("ct")
       .text("================================")
       .text("Factura electrónica en proceso de validación DIAN.")
       .text("¡Gracias por tu compra!")
-      .cut() // ya hace su propio feed antes de cortar (default 3 líneas)
+      .feed(4) // <--- AVANZA 4 LÍNEAS PARA QUE EL TEXTO REBASA LA GUILLOTINA ANTES DE CORTAR
+      .cut()   // Realiza el corte físico del papel
       .cashdraw();
 
-    // close() hace flush() del buffer (manda todo a la impresora) y
-    // después cierra el dispositivo USB — no hace falta llamar flush()
-    // aparte.
+    // Cierra el puerto USB enviando el buffer restante
     await printer.close();
 
     res.json({ success: true, message: "Receipt printed successfully" });
@@ -204,15 +178,7 @@ app.post("/print-receipt", async (req, res) => {
 
 /**
  * POST /preview-receipt
- * Mismo body que /print-receipt, pero en vez de mandar nada a una
- * impresora física devuelve una página HTML que imita el recibo impreso
- * (mismo ancho de "papel", misma fuente monoespaciada, mismas
- * proporciones de columna en las tablas, el logo ya procesado). Pensado
- * para revisar el formato/los datos sin tener la impresora térmica a la
- * mano — no reemplaza una prueba real (el dithering del logo y el
- * espaciado exacto de fuente de la impresora real pueden variar), pero
- * confirma que el contenido y el layout son correctos antes de probar en
- * hardware real. No toca USB para nada.
+ * Muestra la vista previa del recibo en formato HTML para navegador.
  */
 app.post("/preview-receipt", async (req, res) => {
   try {
@@ -275,12 +241,6 @@ function buildReceiptHtml(data, logoDataUri) {
   body { background: #ddd; margin: 0; padding: 24px; display: flex; justify-content: center; font-family: "Courier New", Courier, monospace; }
   .paper { background: #fff; width: 320px; padding: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.25); font-size: 13px; line-height: 1.35; color: #111; }
   .center { text-align: center; }
-  /* Una impresora térmica real no ajusta el texto a una segunda línea
-     dentro de una misma columna de tabla — lo trunca (o se desborda
-     sobre la columna vecina, según el modelo). nowrap + ellipsis imitan
-     mejor ese comportamiento que dejar que el texto haga wrap como en
-     una página web normal — si ves puntos suspensivos acá, es una señal
-     real de que ese texto no cabe en la columna en la impresora física. */
   .row { display: flex; gap: 8px; }
   .row > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .logo { width: 100%; display: block; margin: 0 auto 8px; image-rendering: pixelated; }
@@ -289,6 +249,7 @@ function buildReceiptHtml(data, logoDataUri) {
   .name { font-weight: bold; font-size: 16px; }
   .muted { color: #333; }
   .note { padding: 6px 0; }
+  .bottom { padding-bottom: 30px }
 </style>
 </head>
 <body>
@@ -316,7 +277,7 @@ function buildReceiptHtml(data, logoDataUri) {
     ${twoColRow("Impuesto (INC)", money(tax))}
     ${twoColRow("Total", money(total), true)}
     <hr class="sep-solid" />
-    <div class="center note">
+    <div class="center note bottom">
       <div>Factura electrónica en proceso de validación DIAN.</div>
       <div>¡Gracias por tu compra!</div>
     </div>
@@ -325,8 +286,6 @@ function buildReceiptHtml(data, logoDataUri) {
 </html>`;
 }
 
-// Puerto distinto del backend real (que ya usa 4000) — ver punto sobre
-// esto en CLAUDE.md y docs/THERMAL_PRINTER_INTEGRATION.md.
 const PORT = process.env.PRINT_SERVER_PORT || 4001;
 app.listen(PORT, () => {
   console.log(`[print-server] Servicio de impresión térmica activo en http://localhost:${PORT}`);
