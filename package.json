@@ -1,0 +1,23 @@
+{
+  "name": "mecatos-print-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Servidor local de impresión térmica (ESC/POS) para Mecatos el Santi — corre en la misma terminal física que la impresora USB, ver docs/THERMAL_PRINTER_INTEGRATION.md en la raíz del repo.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@node-escpos/adapter": "0.0.1",
+    "@node-escpos/core": "^0.6.0",
+    "@node-escpos/usb-adapter": "^0.3.1",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "sharp": "^0.33.0",
+    "usb": "2.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
