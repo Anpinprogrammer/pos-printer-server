@@ -78,9 +78,14 @@ solo los puntos que no son obvios leyendo el código:
   X" / método de pago (`tableCustom` con dos columnas de 0.5, igual que
   los `flex justify-between` en pantalla), la tabla de ítems con
   **encabezado** (Producto/Cant./Precio/Subtotal — 4 columnas, no solo 2)
-  y las mismas etiquetas en el resumen final ("Subtotal", "Impuesto
-  (INC)", "Total", "Factura electrónica en proceso de validación DIAN.",
-  "¡Gracias por tu compra!"). `PrintReceiptPayload` (`printerService.ts`,
+  y las mismas etiquetas en el resumen final ("Subtotal", "Total" —
+  **sin** línea de impuesto, ver punto 65 de `backend/CLAUDE.md`: el
+  negocio no declara/cobra impuestos, así que `tax` ya no se calcula ni
+  se imprime — el campo `tax` se quitó por completo de
+  `PrintReceiptPayload` y del payload que le llega a este servicio, no
+  solo se dejó de mostrar en 0 — "Factura electrónica en proceso de
+  validación DIAN.", "¡Gracias por tu compra!"). `PrintReceiptPayload`
+  (`printerService.ts`,
   ambas copias) reflejó esto: ahora incluye `branchAddress`/`branchPhone`
   (antes solo `branch`) y cada ítem lleva `price` (precio unitario)
   además de `quantity`/`subtotal` — si cambias qué muestra

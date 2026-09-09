@@ -65,7 +65,6 @@ app.post("/print-receipt", async (req, res) => {
     invoiceId,
     items = [],
     subtotal,
-    tax,
     total,
     cashier,
     paymentMethod,
@@ -145,10 +144,6 @@ app.post("/print-receipt", async (req, res) => {
       { text: "Subtotal", align: "LEFT", width: TWO_COL_WIDTHS[0] },
       { text: money(subtotal), align: "RIGHT", width: TWO_COL_WIDTHS[1] },
     ]);
-    printer.tableCustom([
-      { text: "Impuesto (INC)", align: "LEFT", width: TWO_COL_WIDTHS[0] },
-      { text: money(tax), align: "RIGHT", width: TWO_COL_WIDTHS[1] },
-    ]);
     printer.style("b");
     printer.tableCustom([
       { text: "Total", align: "LEFT", width: TWO_COL_WIDTHS[0] },
@@ -215,7 +210,6 @@ function buildReceiptHtml(data, logoDataUri) {
     invoiceId,
     items = [],
     subtotal,
-    tax,
     total,
     cashier,
     paymentMethod,
@@ -274,7 +268,6 @@ function buildReceiptHtml(data, logoDataUri) {
     ${itemRows}
     <hr class="sep" />
     ${twoColRow("Subtotal", money(subtotal))}
-    ${twoColRow("Impuesto (INC)", money(tax))}
     ${twoColRow("Total", money(total), true)}
     <hr class="sep-solid" />
     <div class="center note bottom">
