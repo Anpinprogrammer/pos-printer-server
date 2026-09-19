@@ -73,25 +73,61 @@ solo los puntos que no son obvios leyendo el código:
   servidor (no hay recarga en caliente).
 - **El formato impreso replica exactamente el recibo en pantalla**
   (`SaleReceipt.tsx`, ver punto 19 en `admin-frontend/CLAUDE.md`): logo,
-  "Mecatos el Santi" en negrita, nombre/dirección/teléfono de la sede, una
-  fila de dos columnas para "Ticket: X" / fecha y otra para "Atendido por:
-  X" / método de pago (`tableCustom` con dos columnas de 0.5, igual que
-  los `flex justify-between` en pantalla), la tabla de ítems con
-  **encabezado** (Producto/Cant./Precio/Subtotal — 4 columnas, no solo 2)
-  y las mismas etiquetas en el resumen final ("Subtotal", "Total" —
-  **sin** línea de impuesto, ver punto 65 de `backend/CLAUDE.md`: el
-  negocio no declara/cobra impuestos, así que `tax` ya no se calcula ni
-  se imprime — el campo `tax` se quitó por completo de
-  `PrintReceiptPayload` y del payload que le llega a este servicio, no
-  solo se dejó de mostrar en 0 — "Factura electrónica en proceso de
-  validación DIAN.", "¡Gracias por tu compra!"). `PrintReceiptPayload`
-  (`printerService.ts`,
-  ambas copias) reflejó esto: ahora incluye `branchAddress`/`branchPhone`
-  (antes solo `branch`) y cada ítem lleva `price` (precio unitario)
-  además de `quantity`/`subtotal` — si cambias qué muestra
-  `SaleReceipt.tsx` en pantalla, actualiza también esta forma y el
-  armado de la tabla en `print-server/index.js` para que no se
+  "Mecatos el Santi" en negrita, NIT, nombre/dirección/teléfono de la
+  sede, una fila de dos columnas para "Ticket: X" / fecha y otra para
+  "Atendido por: X" / método de pago (`tableCustom` con dos columnas de
+  0.5, igual que los `flex justify-between` en pantalla), la tabla de
+  ítems con **encabezado** (Producto/Cant./Precio/Subtotal — 4 columnas,
+  no solo 2) y las mismas etiquetas en el resumen final ("Subtotal",
+  "Total" — **sin** línea de impuesto, ver punto 65 de
+  `backend/CLAUDE.md`: el negocio no declara/cobra impuestos, así que
+  `tax` ya no se calcula ni se imprime — el campo `tax` se quitó por
+  completo de `PrintReceiptPayload` y del payload que le llega a este
+  servicio, no solo se dejó de mostrar en 0). `PrintReceiptPayload`
+  (`printerService.ts`, ambas copias) reflejó esto: ahora incluye
+  `branchAddress`/`branchPhone` (antes solo `branch`) y cada ítem lleva
+  `price` (precio unitario) además de `quantity`/`subtotal` — si cambias
+  qué muestra `SaleReceipt.tsx` en pantalla, actualiza también esta forma
+  y el armado de la tabla en `print-server/index.js` para que no se
   desincronicen.
+- **Pie del ticket — CUFE/QR/aviso legal REAL cuando la venta ya está
+  timbrada por Siigo, no siempre "en proceso de validación" (rediseño,
+  ver punto 34 de `backend/CLAUDE.md`)**: `SaleReceipt.tsx` calcula
+  `showDianBlock = sale.dianStatus === "APPROVED" && Boolean(sale.cufe)`
+  **una sola vez** y lo manda en el payload — `print-server` NO
+  reimplementa esa condición, solo lee el booleano. Si es `true`, ambos
+  endpoints (`/print-receipt` y `/preview-receipt`) imprimen: "Factura
+  electrónica de venta No. {dianInvoiceNumber}" (arriba, junto al Ticket,
+  si viene), CUFE en texto, el QR, el aviso de letra de cambio (Ley 1231
+  de 2008), la atribución a Siigo S.A.S. como PTA, y — solo si
+  `resolutionNumber` viene poblado (hoy vacío en todas las sedes, ver
+  `Branch.dianConfig`) — la línea de Resolución DIAN. Si es `false`, sigue
+  el mensaje genérico de siempre sin cambios. `NIT` (`1144209364-9`) es
+  una constante hardcodeada en `index.js` (mismo criterio que "Mecatos el
+  Santi" — no varía por sede, así que no hace falta plumbing por el
+  payload ni un campo nuevo en `Branch`).
+- **QR: dos mecanismos distintos, uno por endpoint, a propósito**. El
+  print real (`/print-receipt`) usa `printer.qrimage(texto, { type:
+  "png", mode: "d24" })` de `@node-escpos/core` — un método `async`
+  propio (no el `printer.qrcode()` de más bajo nivel/comando ESC/POS
+  nativo, sin verificar contra el hardware real todavía) que internamente
+  ya usa `qr-image` para generar un PNG y lo imprime por el mismo camino
+  de imagen que el logo, con la misma densidad (`"d24"`). La vista previa
+  (`/preview-receipt`, sin USB) no puede llamar a `printer.qrimage`
+  (necesita un `Printer` real conectado a un `device`), así que genera su
+  propio PNG con `qr.imageSync(texto, { type: "png", size: 4 })` — por
+  eso `qr-image` se agregó como **dependencia directa** de
+  `print-server/package.json` (antes solo llegaba transitivamente vía
+  `@node-escpos/core`, sin pinearla, algo fragil si esa librería alguna
+  vez deja de usarla internamente) — y la codifica a base64 igual que ya
+  hace `getLogoAssets()` con el logo.
+- **`wrapText(texto, 32)`** (nuevo helper en `index.js`) — el pie legal
+  (dos-tres oraciones largas) SÍ necesita wrap manual a 32 columnas para
+  el ticket físico, a diferencia de la vista previa HTML (que trunca con
+  `text-overflow: ellipsis`, ver la nota de "Vista previa" más abajo) —
+  `printer.text()` no hace wrap automático. Si agregas otro bloque de
+  texto largo al ticket físico, reutiliza este helper en vez de escribir
+  uno nuevo.
 - **`printerService.ts` (dos copias — `admin-frontend/src/services/` y
   `admin-frontend/src/cajero/services/`, mismo patrón de duplicación
   intencional que `SaleReceipt.tsx`, ver punto 12 en `admin-frontend/src/

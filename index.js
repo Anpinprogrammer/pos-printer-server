@@ -2,8 +2,35 @@ const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const sharp = require("sharp");
+const qr = require("qr-image");
 const { Printer, Image } = require("@node-escpos/core");
 const USBAdapter = require("@node-escpos/usb-adapter");
+
+// NIT del negocio — constante fija (no varía por sede, mismo criterio que
+// "Mecatos el Santi" ya hardcodeado más abajo). Copia intencional de la
+// misma constante en admin-frontend/src/components/SaleReceipt.tsx (ver
+// punto 34 de backend/CLAUDE.md — rediseño de recibo).
+const BUSINESS_NIT = "1144209364-9";
+
+// Envuelve texto a un ancho fijo de columnas (para el pie legal en ESC/POS,
+// que no hace wrap automático — a diferencia de la vista previa HTML, que
+// trunca con ellipsis, ver docs/THERMAL_PRINTER_INTEGRATION.md sección 8).
+function wrapText(text, width) {
+  const words = String(text).split(" ");
+  const lines = [];
+  let current = "";
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length > width) {
+      if (current) lines.push(current);
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
 
 const app = express();
 app.use(cors());
@@ -68,6 +95,14 @@ app.post("/print-receipt", async (req, res) => {
     total,
     cashier,
     paymentMethod,
+    showDianBlock,
+    cufe,
+    qrCodeUrl,
+    dianInvoiceNumber,
+    resolutionNumber,
+    resolutionPrefix,
+    resolutionFrom,
+    resolutionTo,
   } = req.body;
 
   let device;
@@ -105,10 +140,15 @@ app.post("/print-receipt", async (req, res) => {
       .text("Mecatos el Santi")
       .size(0, 0)
       .style("normal")
+      .text(`NIT: ${BUSINESS_NIT}`)
       .text(branch || "")
       .text(branchAddress || "")
       .text(branchPhone || "")
       .text("================================");
+
+    if (dianInvoiceNumber) {
+      printer.align("ct").text(`Factura electrónica de venta No. ${dianInvoiceNumber}`);
+    }
 
     // Datos del Ticket y Cajero
     printer.align("lt");
@@ -151,12 +191,39 @@ app.post("/print-receipt", async (req, res) => {
     ]);
     printer.style("normal");
 
-    // Mensaje Final, Avance de Papel y Corte
+    // Mensaje Final — CUFE/QR/pie legal si la venta ya está timbrada de
+    // verdad (mismo criterio que SaleReceipt.tsx, `showDianBlock` ya
+    // viene calculado desde ahí), si no el mensaje genérico de siempre.
+    printer.align("ct").text("================================");
+    if (showDianBlock) {
+      printer.text("CUFE:");
+      wrapText(cufe || "", 32).forEach((line) => printer.text(line));
+      if (qrCodeUrl || cufe) {
+        // `mode: "d24"` — misma densidad que ya usa el logo (`printer.
+        // image(escposImage, "d24")` más arriba) para nitidez consistente.
+        await printer.qrimage(qrCodeUrl || cufe, { type: "png", mode: "d24" });
+      }
+      wrapText(
+        "Al pago de esta factura de venta le aplican las normas relativas a la letra de cambio (artículo 5, Ley 1231 de 2008).",
+        32
+      ).forEach((line) => printer.text(line));
+      wrapText(
+        "Documento electrónico emitido a través de Siigo S.A.S., proveedor tecnológico autorizado por la DIAN.",
+        32
+      ).forEach((line) => printer.text(line));
+      if (resolutionNumber) {
+        const range = resolutionFrom != null && resolutionTo != null ? `, del ${resolutionFrom} al ${resolutionTo}` : "";
+        wrapText(`Resolución DIAN No. ${resolutionNumber}, prefijo ${resolutionPrefix || ""}${range}.`, 32).forEach(
+          (line) => printer.text(line)
+        );
+      }
+    } else {
+      printer.text("Factura electrónica en proceso de validación DIAN.");
+    }
+    printer.text("¡Gracias por tu compra!");
+
+    // Avance de Papel y Corte
     printer
-      .align("ct")
-      .text("================================")
-      .text("Factura electrónica en proceso de validación DIAN.")
-      .text("¡Gracias por tu compra!")
       .feed(4) // <--- AVANZA 4 LÍNEAS PARA QUE EL TEXTO REBASA LA GUILLOTINA ANTES DE CORTAR
       .cut()   // Realiza el corte físico del papel
       .cashdraw();
@@ -213,7 +280,35 @@ function buildReceiptHtml(data, logoDataUri) {
     total,
     cashier,
     paymentMethod,
+    showDianBlock,
+    cufe,
+    qrCodeUrl,
+    dianInvoiceNumber,
+    resolutionNumber,
+    resolutionPrefix,
+    resolutionFrom,
+    resolutionTo,
   } = data;
+
+  // Mismo mecanismo que el logo (buffer PNG -> data URI) — `qr-image` ya
+  // es dependencia directa de este paquete (ver arriba), independiente de
+  // `printer.qrimage()` que usa el path real de impresión.
+  let qrDataUri = "";
+  if (showDianBlock && (qrCodeUrl || cufe)) {
+    try {
+      const qrBuffer = qr.imageSync(qrCodeUrl || cufe, { type: "png", size: 4 });
+      qrDataUri = `data:image/png;base64,${qrBuffer.toString("base64")}`;
+    } catch (err) {
+      console.error("[print-server] No se pudo generar el QR para la vista previa:", err);
+    }
+  }
+
+  const dianResolutionText =
+    showDianBlock && resolutionNumber
+      ? `Resolución DIAN No. ${resolutionNumber}, prefijo ${resolutionPrefix || ""}${
+          resolutionFrom != null && resolutionTo != null ? `, del ${resolutionFrom} al ${resolutionTo}` : ""
+        }.`
+      : "";
 
   const itemRows = items
     .map(
@@ -251,11 +346,13 @@ function buildReceiptHtml(data, logoDataUri) {
     <div class="center">
       ${logoDataUri ? `<img class="logo" src="${logoDataUri}" alt="logo" />` : ""}
       <div class="name">Mecatos el Santi</div>
+      <div>NIT: ${escapeHtml(BUSINESS_NIT)}</div>
       <div>${escapeHtml(branch)}</div>
       <div>${escapeHtml(branchAddress)}</div>
       <div>${escapeHtml(branchPhone)}</div>
     </div>
     <hr class="sep-solid" />
+    ${dianInvoiceNumber ? `<div class="center" style="font-weight:600">Factura electrónica de venta No. ${escapeHtml(dianInvoiceNumber)}</div>` : ""}
     ${twoColRow(`Ticket: ${invoiceId}`, formatBogotaDateTime(new Date()))}
     ${twoColRow(`Atendido por: ${cashier}`, paymentMethod)}
     <hr class="sep-solid" />
@@ -270,10 +367,21 @@ function buildReceiptHtml(data, logoDataUri) {
     ${twoColRow("Subtotal", money(subtotal))}
     ${twoColRow("Total", money(total), true)}
     <hr class="sep-solid" />
-    <div class="center note bottom">
+    ${
+      showDianBlock
+        ? `<div class="center note" style="font-size:11px">
+      <div style="font-weight:600">CUFE</div>
+      <div style="word-break:break-all">${escapeHtml(cufe)}</div>
+      ${qrDataUri ? `<img src="${qrDataUri}" alt="QR" style="width:120px;height:120px;margin:6px auto;display:block" />` : ""}
+      <div style="margin-top:4px">Al pago de esta factura de venta le aplican las normas relativas a la letra de cambio (artículo 5, Ley 1231 de 2008).</div>
+      <div style="margin-top:4px">Documento electrónico emitido a través de Siigo S.A.S., proveedor tecnológico autorizado por la DIAN.</div>
+      ${dianResolutionText ? `<div style="margin-top:4px">${escapeHtml(dianResolutionText)}</div>` : ""}
+    </div>`
+        : `<div class="center note">
       <div>Factura electrónica en proceso de validación DIAN.</div>
-      <div>¡Gracias por tu compra!</div>
-    </div>
+    </div>`
+    }
+    <div class="center note bottom">¡Gracias por tu compra!</div>
   </div>
 </body>
 </html>`;
