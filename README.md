@@ -149,3 +149,12 @@ justamente confirmar que la vista previa funcionó.
   app funcione — si no está disponible (apagado, o simplemente no
   instalado en esa máquina), el botón "Imprimir recibo" cae a
   `window.print()` sin ningún error visible para el cajero.
+- `PRINT_ALLOWED_ORIGINS` (default `http://localhost:5174,http://127.0.0.1:5174`) —
+  páginas web autorizadas a mandar órdenes de impresión (recuerda que imprimir
+  también abre el cajón de dinero). Se define en `print-server/.env`, separadas
+  por coma y **solo el dominio** (sin `/` final ni ruta). Para producción agrega
+  ahí el dominio donde se abre el sistema, por ejemplo
+  `PRINT_ALLOWED_ORIGINS=http://localhost:5174,https://su-app.vercel.app`.
+  Si falta, el navegador bloquea la impresión directa y el frontend abre el
+  diálogo de impresión del navegador. Una variable puesta en la terminal al
+  arrancar tiene prioridad sobre el archivo.

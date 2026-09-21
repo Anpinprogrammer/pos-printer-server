@@ -1,6 +1,11 @@
 const path = require("path");
+// Lee `print-server/.env` (junto a este archivo, sin importar desde qué carpeta se
+// inicie). No pisa variables ya definidas en la terminal, así que una variable
+// puesta a mano al arrancar sigue teniendo prioridad sobre el archivo.
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const sharp = require("sharp");
 const qr = require("qr-image");
 const { Printer, Image } = require("@node-escpos/core");
@@ -32,9 +37,111 @@ function wrapText(text, width) {
   return lines;
 }
 
+// --- Aislamiento del servicio -----------------------------------------------
+// Este servidor puede imprimir tickets y ABRIR EL CAJÓN DE DINERO
+// (`printer.cashdraw()`), así que solo debe alcanzarlo el navegador de ESTA
+// máquina. Tres capas, ver punto 68 de CLAUDE.md:
+//  1. Escucha SOLO en 127.0.0.1 (más abajo, en `app.listen`) — ningún otro
+//     equipo de la red puede conectarse.
+//  2. CORS con lista de orígenes permitidos (no `*`): sin esto, CUALQUIER
+//     página web que abra el cajero podría hacer `fetch("http://localhost:
+//     4001/print-receipt")` y disparar impresiones / abrir el cajón.
+//  3. Se valida el header `Host` (evita "DNS rebinding": una web maliciosa
+//     que resuelve su dominio a 127.0.0.1 para saltarse el chequeo de origen).
+const HOST = "127.0.0.1";
+const PORT = Number(process.env.PRINT_SERVER_PORT) || 4001;
+
+// Orígenes del frontend autorizados a imprimir. El de producción (dominio
+// donde esté desplegado admin-frontend) se agrega con PRINT_ALLOWED_ORIGINS,
+// separado por comas — si falta, el navegador bloquea la impresión directa y
+// el frontend cae al diálogo de impresión del navegador.
+const allowedOrigins = (process.env.PRINT_ALLOWED_ORIGINS || "http://localhost:5174,http://127.0.0.1:5174")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const allowedHosts = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`]);
+
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.disable("x-powered-by");
+app.use(helmet());
+
+app.use((req, res, next) => {
+  if (!allowedHosts.has(String(req.headers.host || "").toLowerCase())) {
+    return res.status(403).json({ success: false, error: "Host no permitido" });
+  }
+  next();
+});
+
+// (Va ANTES de `cors`: éste responde los OPTIONS y no dejaría llegar hasta acá.)
+// Chrome exige este header en el preflight cuando una página HTTPS pública
+// (el frontend desplegado) llama a un servidor en localhost ("Private Network
+// Access"). Solo se responde si el origen ya pasó la lista de arriba.
+app.use((req, res, next) => {
+  if (req.headers["access-control-request-private-network"] === "true" && allowedOrigins.includes(req.headers.origin)) {
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+  }
+  next();
+});
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Sin `Origin` (curl, herramientas locales) se deja pasar: el servidor ya
+      // solo escucha en loopback. Con `Origin`, debe estar en la lista.
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      console.warn(`[print-server] Origen rechazado: ${origin} (permitidos: ${allowedOrigins.join(", ")})`);
+      return callback(null, false);
+    },
+    methods: ["POST", "OPTIONS"],
+  })
+);
+
+// Un ticket real pesa unos pocos KB; 100kb sobra y evita cuerpos gigantes.
+app.use(express.json({ limit: "100kb" }));
+
+// --- Validación del payload del recibo --------------------------------------
+const MAX_TEXT = 200;
+const MAX_ITEMS = 100;
+
+const isText = (v, max = MAX_TEXT) => typeof v === "string" && v.length <= max;
+const isOptText = (v, max = MAX_TEXT) => v === undefined || v === null || isText(v, max);
+const isNum = (v) => typeof v === "number" && Number.isFinite(v) && Math.abs(v) < 1e12;
+const isOptNum = (v) => v === undefined || v === null || isNum(v);
+
+/** Devuelve un mensaje de error, o `null` si el payload tiene la forma esperada. */
+function validateReceiptPayload(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return "Payload inválido";
+  const b = body;
+  if (!isText(b.invoiceId)) return "invoiceId inválido";
+  if (!isText(b.cashier)) return "cashier inválido";
+  if (!isText(b.paymentMethod)) return "paymentMethod inválido";
+  if (!isText(b.branch)) return "branch inválido";
+  if (!isOptText(b.branchAddress) || !isOptText(b.branchPhone)) return "datos de sede inválidos";
+  if (!isNum(b.subtotal) || !isNum(b.total)) return "subtotal/total inválidos";
+  if (!Array.isArray(b.items) || b.items.length > MAX_ITEMS) return "items inválidos";
+  for (const item of b.items) {
+    if (!item || typeof item !== "object") return "item inválido";
+    if (!isText(item.name) || !isNum(item.quantity) || !isNum(item.price) || !isNum(item.subtotal)) {
+      return "item con campos inválidos";
+    }
+  }
+  if (b.showDianBlock !== undefined && b.showDianBlock !== null && typeof b.showDianBlock !== "boolean") {
+    return "showDianBlock inválido";
+  }
+  if (!isOptText(b.cufe, 300) || !isOptText(b.qrCodeUrl, 600)) return "cufe/qrCodeUrl inválidos";
+  if (!isOptText(b.dianInvoiceNumber) || !isOptText(b.resolutionNumber) || !isOptText(b.resolutionPrefix)) {
+    return "datos DIAN inválidos";
+  }
+  if (!isOptNum(b.resolutionFrom) || !isOptNum(b.resolutionTo)) return "rango de resolución inválido";
+  return null;
+}
+
+function requireValidReceipt(req, res, next) {
+  const error = validateReceiptPayload(req.body);
+  if (error) return res.status(400).json({ success: false, error });
+  next();
+}
 
 // El logo es una copia local (no se lee del public/ de admin-frontend —
 // print-server es un paquete aparte que puede correr en una máquina
@@ -84,7 +191,7 @@ function formatBogotaDateTime(date) {
  * POST /print-receipt
  * Manda el recibo a la impresora térmica USB conectada a esta máquina.
  */
-app.post("/print-receipt", async (req, res) => {
+app.post("/print-receipt", requireValidReceipt, async (req, res) => {
   const {
     branch,
     branchAddress,
@@ -242,11 +349,17 @@ app.post("/print-receipt", async (req, res) => {
  * POST /preview-receipt
  * Muestra la vista previa del recibo en formato HTML para navegador.
  */
-app.post("/preview-receipt", async (req, res) => {
+app.post("/preview-receipt", requireValidReceipt, async (req, res) => {
   try {
     const { dataUri } = await getLogoAssets();
     const html = buildReceiptHtml(req.body, dataUri);
-    res.set("Content-Type", "text/html; charset=utf-8").send(html);
+    // CSP estricta para el HTML de la vista previa: solo imágenes `data:` y
+    // estilos inline — ningún script podría ejecutarse aunque algún campo
+    // escapara el `escapeHtml` de `buildReceiptHtml`.
+    res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .set("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+      .send(html);
   } catch (error) {
     console.error("Preview build failed:", error);
     res.status(500).json({ success: false, error: error.message || "Preview failed" });
@@ -325,6 +438,7 @@ function buildReceiptHtml(data, logoDataUri) {
 <html lang="es">
 <head>
 <meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'" />
 <title>Vista previa — recibo térmico</title>
 <style>
   body { background: #ddd; margin: 0; padding: 24px; display: flex; justify-content: center; font-family: "Courier New", Courier, monospace; }
@@ -387,7 +501,8 @@ function buildReceiptHtml(data, logoDataUri) {
 </html>`;
 }
 
-const PORT = process.env.PRINT_SERVER_PORT || 4001;
-app.listen(PORT, () => {
-  console.log(`[print-server] Servicio de impresión térmica activo en http://localhost:${PORT}`);
+// Solo loopback — ver "Aislamiento del servicio" arriba.
+app.listen(PORT, HOST, () => {
+  console.log(`[print-server] Servicio de impresión térmica activo en http://${HOST}:${PORT}`);
+  console.log(`[print-server] Orígenes permitidos: ${allowedOrigins.join(", ")}`);
 });

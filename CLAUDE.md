@@ -167,3 +167,40 @@ solo los puntos que no son obvios leyendo el código:
   una impresora térmica real no ajusta el texto de una columna fija a una
   segunda línea (lo trunca/desborda). Ver `docs/
   THERMAL_PRINTER_INTEGRATION.md` sección 8.
+
+### 68. Aislamiento del servicio de impresión — solo `127.0.0.1`, CORS con lista de orígenes, `Host` validado y payload validado
+
+Este servidor puede **imprimir tickets y abrir el cajón de dinero** (`printer.cashdraw()` al final de
+cada recibo), así que se trata como un servicio privilegiado de la máquina de la caja. Antes escuchaba
+en todas las interfaces con `cors()` abierto: cualquier equipo de la red local, **o cualquier página web
+que abriera el cajero en su navegador**, podía llamar a `http://localhost:4001/print-receipt`.
+
+- **Bind estricto a `127.0.0.1`** (`app.listen(PORT, HOST)` con `HOST` constante, sin variable de
+  entorno a propósito — que nadie lo abra a la red por accidente). Verificado con `lsof`: el socket es
+  `127.0.0.1:<puerto>`, no `*:<puerto>`.
+- **CORS con lista**, no `*`. Por defecto solo `http://localhost:5174` y `http://127.0.0.1:5174`
+  (frontend en desarrollo). **Para producción hay que definir `PRINT_ALLOWED_ORIGINS`** con el dominio
+  donde esté desplegado `admin-frontend` (varios separados por coma). Si falta, el navegador bloquea la
+  petición y el frontend hace su fallback silencioso a `window.print()` (ver punto 32) — la impresión
+  "funciona" pero por el diálogo del navegador, no directo a la térmica, y no hay un error visible: el
+  primer síntoma es que dejó de imprimir directo. Al arrancar y al rechazar un origen se loguea la
+  lista permitida para diagnosticarlo.
+- **Header `Access-Control-Allow-Private-Network`**: Chrome lo exige en el preflight cuando una página
+  HTTPS pública llama a un servidor en `localhost`. Solo se responde si el origen ya está en la lista, y
+  su middleware va **antes** de `cors` (éste responde los `OPTIONS` y, si va antes, el header nunca se envía).
+- **Chequeo del header `Host`** (`localhost:<puerto>` / `127.0.0.1:<puerto>`) contra "DNS rebinding".
+- **Validación del payload** (`validateReceiptPayload`, sin dependencias nuevas) en `/print-receipt` y
+  `/preview-receipt`: textos ≤ 200 caracteres, hasta 100 ítems, números finitos, `showDianBlock` booleano.
+  Un payload inválido responde 400 **antes** de tocar la impresora (antes, un `items` que no fuera un arreglo
+  reventaba a mitad de impresión con el puerto USB ya abierto). **Si cambias `PrintReceiptPayload`** en
+  `printerService.ts` (las dos copias), actualiza este validador o la impresión empezará a devolver 400.
+- **`express.json({ limit: "100kb" })`** (un ticket real pesa unos KB) y `helmet()` (nueva dependencia,
+  `helmet@7`, instalada con `--ignore-scripts` para no tocar el binario nativo de `usb`).
+- **Vista previa**: además de `escapeHtml` en cada campo, el HTML lleva un `<meta http-equiv=
+  "Content-Security-Policy">` (`default-src 'none'; img-src data:; style-src 'unsafe-inline'`) — el header
+  HTTP no serviría porque el frontend inyecta el HTML con `document.write` en una ventana nueva.
+- **Variables de entorno**: `PRINT_SERVER_PORT` (default 4001, ya existía) y `PRINT_ALLOWED_ORIGINS`. Se leen de `print-server/.env` (vía `dotenv`, ruta relativa a `index.js`), que **sí va en el repo** porque solo tiene direcciones, no secretos — así llega a cada terminal con un `git pull`. Una variable definida en la terminal al arrancar gana sobre el archivo. **Para producción, agrega el dominio de Vercel a `PRINT_ALLOWED_ORIGINS` en ese `.env`** (sin `/` final ni ruta). No pongas secretos ahí.
+- **Verificado en vivo**: `Host: evil.com` → 403; preflight desde origen ajeno sin `Allow-Origin`; `items`
+  no arreglo → 400; cuerpo de 200 KB → 413; vista previa escapa `<b>` y lleva la CSP.
+- **Higiene del repo**: `print-server/` tiene `node_modules/` **versionado** y sin `.gitignore` (por eso
+  instalar `helmet` aparece en `git status` como archivos de `node_modules`). Conviene ignorarlo y sacarlo del control de versiones.

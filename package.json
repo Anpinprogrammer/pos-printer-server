@@ -13,7 +13,9 @@
     "@node-escpos/core": "^0.6.0",
     "@node-escpos/usb-adapter": "^0.3.1",
     "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
     "express": "^4.19.2",
+    "helmet": "^7.2.0",
     "qr-image": "^3.2.0",
     "sharp": "^0.33.0",
     "usb": "2.18.0"
