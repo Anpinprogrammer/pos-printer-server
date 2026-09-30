@@ -90,19 +90,23 @@ solo los puntos que no son obvios leyendo el código:
   qué muestra `SaleReceipt.tsx` en pantalla, actualiza también esta forma
   y el armado de la tabla en `print-server/index.js` para que no se
   desincronicen.
-- **Pie del ticket — CUFE/QR/aviso legal REAL cuando la venta ya está
-  timbrada por Siigo, no siempre "en proceso de validación" (rediseño,
-  ver punto 34 de `backend/CLAUDE.md`)**: `SaleReceipt.tsx` calcula
+- **Pie del ticket — CUFE/QR/aviso legal cuando la venta ya está timbrada
+  por SIIGO o FACTUS; atribución por provider** (ver fase DIAN en
+  `backend/CLAUDE.md`): `SaleReceipt.tsx` calcula
   `showDianBlock = sale.dianStatus === "APPROVED" && Boolean(sale.cufe)`
-  **una sola vez** y lo manda en el payload — `print-server` NO
-  reimplementa esa condición, solo lee el booleano. Si es `true`, ambos
+  **una sola vez** y lo manda en el payload junto con `dianProvider`;
+  `print-server` NO reimplementa la condición, solo lee el booleano y usa el
+  provider para la atribución dinámica. Si es `true`, ambos
   endpoints (`/print-receipt` y `/preview-receipt`) imprimen: "Factura
   electrónica de venta No. {dianInvoiceNumber}" (arriba, junto al Ticket,
   si viene), CUFE en texto, el QR, el aviso de letra de cambio (Ley 1231
-  de 2008), la atribución a Siigo S.A.S. como PTA, y — solo si
+  de 2008), la atribución dinámica de marca (`Siigo`/`Factus`, sin inventar
+  razón social o sufijo legal), y — solo si
   `resolutionNumber` viene poblado (hoy vacío en todas las sedes, ver
-  `Branch.dianConfig`) — la línea de Resolución DIAN. Si es `false`, sigue
-  el mensaje genérico de siempre sin cambios. `NIT` (`1144209364-9`) es
+  `Branch.dianConfig`) — la línea de Resolución DIAN. Para `MOCK` el
+  frontend apaga `showDianBlock` y el ticket imprime un aviso explícito de
+  simulación, nunca el CUFE/QR ficticio. Para ventas históricas sin provider
+  registrado se usa atribución genérica. `NIT` (`1144209364-9`) es
   una constante hardcodeada en `index.js` (mismo criterio que "Mecatos el
   Santi" — no varía por sede, así que no hace falta plumbing por el
   payload ni un campo nuevo en `Branch`).
@@ -190,7 +194,9 @@ que abriera el cajero en su navegador**, podía llamar a `http://localhost:4001/
   su middleware va **antes** de `cors` (éste responde los `OPTIONS` y, si va antes, el header nunca se envía).
 - **Chequeo del header `Host`** (`localhost:<puerto>` / `127.0.0.1:<puerto>`) contra "DNS rebinding".
 - **Validación del payload** (`validateReceiptPayload`, sin dependencias nuevas) en `/print-receipt` y
-  `/preview-receipt`: textos ≤ 200 caracteres, hasta 100 ítems, números finitos, `showDianBlock` booleano.
+  `/preview-receipt`: textos ≤ 200 caracteres, hasta 100 ítems, números finitos,
+  `showDianBlock` booleano y `dianProvider` (`MOCK`/`SIIGO`/`FACTUS`/`LEGACY`).
+  Rechaza además un `showDianBlock=true` para MOCK.
   Un payload inválido responde 400 **antes** de tocar la impresora (antes, un `items` que no fuera un arreglo
   reventaba a mitad de impresión con el puerto USB ya abierto). **Si cambias `PrintReceiptPayload`** en
   `printerService.ts` (las dos copias), actualiza este validador o la impresión empezará a devolver 400.

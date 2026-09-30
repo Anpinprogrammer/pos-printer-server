@@ -116,6 +116,9 @@ function validateReceiptPayload(body) {
   if (!isText(b.invoiceId)) return "invoiceId inválido";
   if (!isText(b.cashier)) return "cashier inválido";
   if (!isText(b.paymentMethod)) return "paymentMethod inválido";
+  if (b.dianProvider !== undefined && !["MOCK", "SIIGO", "FACTUS", "LEGACY"].includes(b.dianProvider)) {
+    return "dianProvider inválido";
+  }
   if (!isText(b.branch)) return "branch inválido";
   if (!isOptText(b.branchAddress) || !isOptText(b.branchPhone)) return "datos de sede inválidos";
   if (!isNum(b.subtotal) || !isNum(b.total)) return "subtotal/total inválidos";
@@ -128,6 +131,9 @@ function validateReceiptPayload(body) {
   }
   if (b.showDianBlock !== undefined && b.showDianBlock !== null && typeof b.showDianBlock !== "boolean") {
     return "showDianBlock inválido";
+  }
+  if (b.showDianBlock === true && b.dianProvider === "MOCK") {
+    return "Una factura simulada no puede imprimir el bloque DIAN";
   }
   if (!isOptText(b.cufe, 300) || !isOptText(b.qrCodeUrl, 600)) return "cufe/qrCodeUrl inválidos";
   if (!isOptText(b.dianInvoiceNumber) || !isOptText(b.resolutionNumber) || !isOptText(b.resolutionPrefix)) {
@@ -182,6 +188,16 @@ function money(n) {
   return `$${Number(n).toLocaleString("es-CO")}`;
 }
 
+function dianProviderAttribution(provider) {
+  if (provider === "FACTUS") {
+    return "Documento electrónico emitido a través de Factus, proveedor tecnológico autorizado por la DIAN.";
+  }
+  if (provider === "SIIGO") {
+    return "Documento electrónico emitido a través de Siigo, proveedor tecnológico autorizado por la DIAN.";
+  }
+  return "Documento electrónico emitido a través de un proveedor tecnológico autorizado por la DIAN.";
+}
+
 const COLOMBIA_TIME_ZONE = "America/Bogota";
 function formatBogotaDateTime(date) {
   return date.toLocaleString("es-CO", { timeZone: COLOMBIA_TIME_ZONE });
@@ -202,6 +218,7 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
     total,
     cashier,
     paymentMethod,
+    dianProvider = "LEGACY",
     showDianBlock,
     cufe,
     qrCodeUrl,
@@ -253,7 +270,7 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
       .text(branchPhone || "")
       .text("================================");
 
-    if (dianInvoiceNumber) {
+    if (dianInvoiceNumber && dianProvider !== "MOCK") {
       printer.align("ct").text(`Factura electrónica de venta No. ${dianInvoiceNumber}`);
     }
 
@@ -315,7 +332,7 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
         32
       ).forEach((line) => printer.text(line));
       wrapText(
-        "Documento electrónico emitido a través de Siigo S.A.S., proveedor tecnológico autorizado por la DIAN.",
+        dianProviderAttribution(dianProvider),
         32
       ).forEach((line) => printer.text(line));
       if (resolutionNumber) {
@@ -325,7 +342,11 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
         );
       }
     } else {
-      printer.text("Factura electrónica en proceso de validación DIAN.");
+      printer.text(
+        dianProvider === "MOCK"
+          ? "Simulación local (MOCK); no es factura válida ante la DIAN."
+          : "Factura electrónica en proceso de validación DIAN."
+      );
     }
     printer.text("¡Gracias por tu compra!");
 
@@ -393,6 +414,7 @@ function buildReceiptHtml(data, logoDataUri) {
     total,
     cashier,
     paymentMethod,
+    dianProvider = "LEGACY",
     showDianBlock,
     cufe,
     qrCodeUrl,
@@ -466,7 +488,7 @@ function buildReceiptHtml(data, logoDataUri) {
       <div>${escapeHtml(branchPhone)}</div>
     </div>
     <hr class="sep-solid" />
-    ${dianInvoiceNumber ? `<div class="center" style="font-weight:600">Factura electrónica de venta No. ${escapeHtml(dianInvoiceNumber)}</div>` : ""}
+    ${dianInvoiceNumber && dianProvider !== "MOCK" ? `<div class="center" style="font-weight:600">Factura electrónica de venta No. ${escapeHtml(dianInvoiceNumber)}</div>` : ""}
     ${twoColRow(`Ticket: ${invoiceId}`, formatBogotaDateTime(new Date()))}
     ${twoColRow(`Atendido por: ${cashier}`, paymentMethod)}
     <hr class="sep-solid" />
@@ -488,11 +510,11 @@ function buildReceiptHtml(data, logoDataUri) {
       <div style="word-break:break-all">${escapeHtml(cufe)}</div>
       ${qrDataUri ? `<img src="${qrDataUri}" alt="QR" style="width:120px;height:120px;margin:6px auto;display:block" />` : ""}
       <div style="margin-top:4px">Al pago de esta factura de venta le aplican las normas relativas a la letra de cambio (artículo 5, Ley 1231 de 2008).</div>
-      <div style="margin-top:4px">Documento electrónico emitido a través de Siigo S.A.S., proveedor tecnológico autorizado por la DIAN.</div>
+       <div style="margin-top:4px">${escapeHtml(dianProviderAttribution(dianProvider))}</div>
       ${dianResolutionText ? `<div style="margin-top:4px">${escapeHtml(dianResolutionText)}</div>` : ""}
     </div>`
         : `<div class="center note">
-      <div>Factura electrónica en proceso de validación DIAN.</div>
+      <div>${dianProvider === "MOCK" ? "Simulación local (MOCK); no es factura válida ante la DIAN." : "Factura electrónica en proceso de validación DIAN."}</div>
     </div>`
     }
     <div class="center note bottom">¡Gracias por tu compra!</div>
