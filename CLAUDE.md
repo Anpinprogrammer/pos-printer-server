@@ -171,6 +171,53 @@ solo los puntos que no son obvios leyendo el código:
   una impresora térmica real no ajusta el texto de una columna fija a una
   segunda línea (lo trunca/desborda). Ver `docs/
   THERMAL_PRINTER_INTEGRATION.md` sección 8.
+- **Cola FIFO en proceso + retry de apertura + `/health`** (lo que evita
+  que un trabajo a medias bloquee la térmica y haga que DiDi/u otro
+  cliente "deje de imprimir" — el bug clásico de interface-claim USB
+  filtrado):
+  - **`PrintQueue`** (clase en `index.js`): serializa TODAS las llamadas
+    a `/print-receipt`; una sola abre el USB a la vez, las demás
+    esperan. Cap `PRINT_QUEUE_MAX` (default 50) y timeout
+    `PRINT_QUEUE_TIMEOUT_MS` (default 15 s) — un cashier en bucle no
+    puede hacer crecer la cola sin límite, y un job que se quedó pegado
+    en el extremo frontal de la cola no bloquea al resto para siempre.
+  - **`openWithRetry`** (helper en `index.js`): hasta 3 intentos con
+    backoff lineal (200, 400, 600 ms) solo en `LIBUSB_ERROR_BUSY`
+    (`errno === -6` / "EBUSY") — el caso típico es que el driver de DiDi
+    tenga el interface-claim en ese instante. Otros errores (permiso,
+    dispositivo inexistente) NO se reintentan, fallarían igual.
+  - **`runPrintJob(payload, jobId)`**: el cuerpo real del trabajo vive
+    acá, **NO** inline en el handler de Express. La pieza clave: TODA la
+    apertura/uso del dispositivo va dentro de un `try { ... } finally
+    { ... }` que ejecuta `printer.close()` y `device.close()` en TODAS
+    las rutas (éxito, excepción, timeout). Antes, `printer.close()`
+    corría solo en el camino feliz — un solo `await` que fallara a la
+    mitad dejaba el puerto USB bloqueado hasta que se desconectaba
+    físicamente la impresora. Ahora, aunque el handler de Express se
+    caiga, el `finally` libera el interface-claim.
+  - **ESC @ al inicio Y al final** (`printer.hardware("init")`): limpia
+    basura residual del trabajo anterior (típico: un ticket DiDi que se
+    cayó a la mitad justo antes de cedernos el puerto) y deja el
+    dispositivo en estado conocido para el siguiente cliente.
+  - **`printer.cut(false, 4)`** (sin `.feed(...)` antes): `@node-escpos/
+    core@0.6.x` ya hace su propio feed dentro de `cut()`. El código
+    original tenía `.feed(4).cut()`, que resultaba en 7 líneas de
+    avance (doble feed). Ya está corregido — un solo `.cut(false, 4)`.
+  - **`GET /health`** (probe liviano, NO toca el USB): mismo patrón que
+    `GET /health` del backend (punto 58 del `CLAUDE.md` raíz) — útil
+    para un monitor externo (UptimeRobot, etc.) y para confirmar en
+    campo que no hay jobs atascados. Responde `{ ok: true, queueDepth,
+    runningJob }`.
+  - **Mixed Content / HTTPS en producción**: las DOS copias de
+    `printerService.ts` (`src/services/` y `src/cajero/services/`)
+    resuelven la URL vía `printServerUrl(path)`: si la página está en
+    HTTPS, van a `http://127.0.0.1:4001/...` (loopback, no bloqueado
+    por Mixed Content porque `127.0.0.1` está en la allowlist de los
+    navegadores); en HTTP siguen usando `localhost:4001` como antes.
+    Sin esto, el frontend en producción HTTPS hacía `fetch` a
+    `http://localhost:4001`, el navegador lo bloqueaba, el catch
+    silencioso caía a `window.print()`, y desde el cajero parecía "la
+    térmica está ocupada".
 
 ### 68. Aislamiento del servicio de impresión — solo `127.0.0.1`, CORS con lista de orígenes, `Host` validado y payload validado
 

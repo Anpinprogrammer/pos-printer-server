@@ -37,6 +37,91 @@ function wrapText(text, width) {
   return lines;
 }
 
+// --- Cola de impresión + retry de apertura USB ------------------------------
+// Antes, cada POST /print-receipt creaba un USBAdapter nuevo y llamaba
+// `device.open()` sin serializar: dos requests simultáneos peleaban el
+// interface-claim exclusivo de libusb, el perdedor devolvía 500, y el
+// "ganador" — si algo fallaba a mitad del trabajo — nunca llegaba a
+// `printer.close()`, dejando el puerto USB bloqueado hasta que se
+// desconectaba la impresora (visto en la práctica como "DiDi dejó de
+// imprimir"). Dos piezas, ver punto 32 de CLAUDE.md:
+//
+//  - `PrintQueue`: FIFO en proceso, serializa TODAS las impresiones. Una
+//    sola abre el USB a la vez; las demás esperan. Si la cola se llena
+//    (cajero trabado en un bucle, DiDi monopolizando la impresora, etc.)
+//    rechaza con 503 antes de aceptar más.
+//  - `openWithRetry`: hasta 3 intentos con backoff lineal. Solo reintenta
+//    en EBUSY/LIBUSB_ERROR_BUSY (otro cliente — típicamente el driver de
+//    DiDi — tiene el interface-claim en ese instante).
+const PRINT_QUEUE_MAX = Number(process.env.PRINT_QUEUE_MAX) || 50;
+const PRINT_QUEUE_TIMEOUT_MS = Number(process.env.PRINT_QUEUE_TIMEOUT_MS) || 15000;
+const USB_OPEN_RETRIES = 3;
+const USB_OPEN_RETRY_BASE_MS = 200;
+
+class PrintQueue {
+  constructor() {
+    this.queue = [];
+    this.running = false;
+    this.activeJob = null;
+  }
+  enqueue(jobFn) {
+    return new Promise((resolve, reject) => {
+      if (this.queue.length >= PRINT_QUEUE_MAX) {
+        return reject(new Error("Print queue full — intente de nuevo"));
+      }
+      const entry = { jobFn, resolve, reject, enqueuedAt: Date.now(), timeoutHandle: null };
+      entry.timeoutHandle = setTimeout(() => {
+        const idx = this.queue.indexOf(entry);
+        if (idx !== -1) {
+          this.queue.splice(idx, 1);
+          reject(new Error("Print queue timeout — intente de nuevo"));
+        }
+      }, PRINT_QUEUE_TIMEOUT_MS);
+      this.queue.push(entry);
+      this.#drain();
+    });
+  }
+  async #drain() {
+    if (this.running) return;
+    this.running = true;
+    while (this.queue.length) {
+      const next = this.queue.shift();
+      clearTimeout(next.timeoutHandle);
+      this.activeJob = next;
+      try {
+        next.resolve(await next.jobFn());
+      } catch (err) {
+        next.reject(err);
+      } finally {
+        this.activeJob = null;
+      }
+    }
+    this.running = false;
+  }
+}
+const printQueue = new PrintQueue();
+
+async function openWithRetry(device, attempts = USB_OPEN_RETRIES, baseMs = USB_OPEN_RETRY_BASE_MS) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await new Promise((resolve, reject) => {
+        device.open((err) => (err ? reject(err) : resolve(undefined)));
+      });
+      return;
+    } catch (err) {
+      lastErr = err;
+      // LIBUSB_ERROR_BUSY = -6 / EBUSY. Solo reintenta ese caso — cualquier
+      // otro error (permiso, dispositivo inexistente) no se va a arreglar
+      // esperando 200 ms.
+      const isBusy = err?.errno === -6 || /busy|EBUSY/i.test(String(err?.message || err));
+      if (!isBusy || i === attempts - 1) throw err;
+      await new Promise((r) => setTimeout(r, baseMs * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 // --- Aislamiento del servicio -----------------------------------------------
 // Este servidor puede imprimir tickets y ABRIR EL CAJÓN DE DINERO
 // (`printer.cashdraw()`), así que solo debe alcanzarlo el navegador de ESTA
@@ -109,7 +194,38 @@ const isOptText = (v, max = MAX_TEXT) => v === undefined || v === null || isText
 const isNum = (v) => typeof v === "number" && Number.isFinite(v) && Math.abs(v) < 1e12;
 const isOptNum = (v) => v === undefined || v === null || isNum(v);
 
-/** Devuelve un mensaje de error, o `null` si el payload tiene la forma esperada. */
+/**
+ * Coerce de "lo que venga" a un número finito. Acepta:
+ *  - numbers  → 그대로
+ *  - strings numéricas ("3500", "3500.5", "  3500 ") → Number(v)
+ *  - null/undefined → 0  (campo faltante en ventas viejas / ticket offline)
+ * Rechaza objetos, arrays, booleanos, strings no numéricos, NaN, Infinity.
+ */
+function toSafeNumber(v) {
+  if (v === undefined || v === null) return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+  return null; // señal de "esto no es un número, ni lo vamos a inventar"
+}
+
+/**
+ * Devuelve un mensaje de error, o `null` si el payload tiene la forma esperada.
+ *
+ * Antes, `item.con campos inválidos` rechazaba CUALQUIER ítem con `quantity`,
+ * `price` o `subtotal` null/undefined — típico de ventas guardadas con un
+ * campo faltante (ej. tickets offline viejos encolados antes del corte del
+ * punto 8 de CLAUDE.md, ventas migradas con campos parciales, o un campo
+ * que el schema Mongoose marca como `Number` pero la data real tenía `null`).
+ * Eso bloqueaba imprimir/previsualizar recibos de ventas perfectamente
+ * legibles, con un 400 que el frontend mostraba como "Print-server local no
+ * disponible para vista previa" — diagnóstico falso, parecía problema de
+ * red cuando en realidad era un campo con null.
+ *
+ * La política nueva es tolerante con la data del recibo (un item con
+ * `price` faltante se imprime como `$0`; con `name` faltante como "Producto")
+ * y estricta solo con lo que podría romper el render (item no-objeto,
+ * subtotal/total del documento que no se puede leer como número).
+ */
 function validateReceiptPayload(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "Payload inválido";
   const b = body;
@@ -121,12 +237,30 @@ function validateReceiptPayload(body) {
   }
   if (!isText(b.branch)) return "branch inválido";
   if (!isOptText(b.branchAddress) || !isOptText(b.branchPhone)) return "datos de sede inválidos";
-  if (!isNum(b.subtotal) || !isNum(b.total)) return "subtotal/total inválidos";
+  // `subtotal`/`total` a nivel de venta: rechazar si NO se pueden leer como
+  // número (incluso tolerando strings numéricas). Una venta sin total
+  // imprimible NO debe salir.
+  if (toSafeNumber(b.subtotal) === null || toSafeNumber(b.total) === null) {
+    return "subtotal/total inválidos";
+  }
   if (!Array.isArray(b.items) || b.items.length > MAX_ITEMS) return "items inválidos";
   for (const item of b.items) {
-    if (!item || typeof item !== "object") return "item inválido";
-    if (!isText(item.name) || !isNum(item.quantity) || !isNum(item.price) || !isNum(item.subtotal)) {
-      return "item con campos inválidos";
+    if (!item || typeof item !== "object" || Array.isArray(item)) return "item inválido";
+    // `name` puede faltar → cae a "Producto" en el render; no es 400.
+    // `quantity`/`price`/`subtotal` faltantes o null → 0 en el render.
+    // Solo 400 si vienen con un TIPO que claramente no es número (objeto,
+    // array, booleano) — `toSafeNumber` devuelve null en ese caso.
+    if (
+      toSafeNumber(item.quantity) === null ||
+      toSafeNumber(item.price) === null ||
+      toSafeNumber(item.subtotal) === null
+    ) {
+      return "item con campos numéricos inválidos";
+    }
+    // `name` sigue opcional — vacío/no-string no rompe el render. Si es un
+    // objeto/array (raro, pero defensivo) → 400.
+    if (item.name !== undefined && item.name !== null && typeof item.name !== "string") {
+      return "item.name debe ser string";
     }
   }
   if (b.showDianBlock !== undefined && b.showDianBlock !== null && typeof b.showDianBlock !== "boolean") {
@@ -206,8 +340,31 @@ function formatBogotaDateTime(date) {
 /**
  * POST /print-receipt
  * Manda el recibo a la impresora térmica USB conectada a esta máquina.
+ *
+ * Solo encola: el trabajo se hace dentro de `runPrintJob`, que SIEMPRE
+ * libera el interface-claim USB (printer.close + device.close) en un
+ * `finally` — esa es la pieza que evita que un job que falló a la mitad
+ * bloquee el puerto y haga que DiDi (u otro cliente) "deje de imprimir".
  */
 app.post("/print-receipt", requireValidReceipt, async (req, res) => {
+  const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  console.log(`[print-server] [job ${jobId}] enqueued`);
+  try {
+    await printQueue.enqueue(() => runPrintJob(req.body, jobId));
+    res.json({ success: true, jobId, message: "Receipt printed successfully" });
+  } catch (error) {
+    console.error(`[print-server] [job ${jobId}] failed:`, error);
+    res.status(500).json({ success: false, jobId, error: error.message || "Print failed" });
+  }
+});
+
+/**
+ * Construye y manda UN recibo a la impresora. Garantiza que `printer.close()`
+ * y `device.close()` se ejecuten en TODAS las rutas (éxito, excepción,
+ * timeout) — esto es lo que evita que un trabajo a medias deje el puerto
+ * USB bloqueado.
+ */
+async function runPrintJob(payload, jobId) {
   const {
     branch,
     branchAddress,
@@ -227,30 +384,48 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
     resolutionPrefix,
     resolutionFrom,
     resolutionTo,
-  } = req.body;
+  } = payload;
 
-  let device;
+  let device = null;
+  let printer = null;
   try {
-    device = new USBAdapter();
-  } catch (err) {
-    console.error("Printer detection error:", err);
-    return res.status(500).json({ success: false, error: "Thermal printer not connected or busy" });
-  }
+    try {
+      device = new USBAdapter();
+    } catch (err) {
+      throw new Error("Thermal printer not connected or busy");
+    }
 
-  try {
-    await new Promise((resolve, reject) => {
-      device.open((err) => (err ? reject(err) : resolve(undefined)));
-    });
+    // Reintenta hasta 3 veces si otro cliente (driver de DiDi, otro
+    // servicio) tiene el interface-claim en ese instante. Ver `openWithRetry`
+    // arriba.
+    await openWithRetry(device);
 
     // 1. CODIFICACIÓN EN ESPAÑOL (PC850 / Latin-1)
     // Permite imprimir tildes, eñes y signos como "¡" sin caracteres raros.
-    const printerOptions = {
-      encoding: "850",
-    };
-    const printer = new Printer(device, printerOptions);
+    const printerOptions = { encoding: "850" };
+    printer = new Printer(device, printerOptions);
 
-    // Recompone el estado de hardware de la impresora
+    // ESC @ — resetea TODO el estado de hardware de la impresora al
+    // arrancar cada trabajo. Limpia cualquier basura residual de un job
+    // previo (típico: un trabajo de DiDi que se cayó a la mitad justo
+    // antes de que nos cedieran el puerto).
     printer.hardware("init");
+
+    // Normaliza items: campos faltantes se rellenan con defaults tolerantes
+    // (mismo criterio que `validateReceiptPayload` relajado, arriba). Esto
+    // permite imprimir/previsualizar ventas con data parcial sin tronar el
+    // render: nombre "Producto", numéricos → 0.
+    const safeItems = items.map((it) => ({
+      name: typeof it?.name === "string" ? it.name : "Producto",
+      quantity: toSafeNumber(it?.quantity) ?? 0,
+      price: toSafeNumber(it?.price) ?? 0,
+      subtotal: toSafeNumber(it?.subtotal) ?? 0,
+    }));
+    // `subtotal`/`total` a nivel de venta — `validateReceiptPayload` ya
+    // garantiza que estos son números legibles; los pasamos por `toSafeNumber`
+    // igual para no asumir nada.
+    const safeSubtotal = toSafeNumber(subtotal) ?? 0;
+    const safeTotal = toSafeNumber(total) ?? 0;
 
     // Encabezado: Logo + Nombre + Datos de la sede
     printer.align("ct");
@@ -293,7 +468,7 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
       { text: "Precio", align: "RIGHT", width: ITEM_COL_WIDTHS[2] },
       { text: "Subtotal", align: "RIGHT", width: ITEM_COL_WIDTHS[3] },
     ]);
-    items.forEach((item) => {
+    safeItems.forEach((item) => {
       printer.tableCustom([
         { text: item.name, align: "LEFT", width: ITEM_COL_WIDTHS[0] },
         { text: String(item.quantity), align: "RIGHT", width: ITEM_COL_WIDTHS[1] },
@@ -306,12 +481,12 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
     printer.text("--------------------------------");
     printer.tableCustom([
       { text: "Subtotal", align: "LEFT", width: TWO_COL_WIDTHS[0] },
-      { text: money(subtotal), align: "RIGHT", width: TWO_COL_WIDTHS[1] },
+      { text: money(safeSubtotal), align: "RIGHT", width: TWO_COL_WIDTHS[1] },
     ]);
     printer.style("b");
     printer.tableCustom([
       { text: "Total", align: "LEFT", width: TWO_COL_WIDTHS[0] },
-      { text: money(total), align: "RIGHT", width: TWO_COL_WIDTHS[1] },
+      { text: money(safeTotal), align: "RIGHT", width: TWO_COL_WIDTHS[1] },
     ]);
     printer.style("normal");
 
@@ -351,20 +526,43 @@ app.post("/print-receipt", requireValidReceipt, async (req, res) => {
     printer.text("¡Gracias por tu compra!");
 
     // Avance de Papel y Corte
-    printer
-      .feed(4) // <--- AVANZA 4 LÍNEAS PARA QUE EL TEXTO REBASA LA GUILLOTINA ANTES DE CORTAR
-      .cut()   // Realiza el corte físico del papel
-      .cashdraw();
+    //
+    // `printer.cut(false, 4)` hace el corte físico Y ya hace su propio feed
+    // (3 líneas por defecto en @node-escpos/core@0.6.x; acá lo subimos a 4).
+    // NO llamar `.feed(...)` justo antes de `.cut(...)` — antes había un
+    // `.feed(4).cut()` que resultaba en 7 líneas de avance (doble feed),
+    // desperdiciando papel. Ver punto 32 de CLAUDE.md.
+    printer.cut(false, 4);
+    printer.cashdraw();
 
-    // Cierra el puerto USB enviando el buffer restante
-    await printer.close();
-
-    res.json({ success: true, message: "Receipt printed successfully" });
-  } catch (error) {
-    console.error("Print execution failed:", error);
-    res.status(500).json({ success: false, error: error.message || "Print failed" });
+    // ESC @ al FINAL: deja la impresora en estado limpio para el siguiente
+    // cliente (típicamente el driver USB de DiDi Food). Belt-and-suspenders:
+    // combinado con el `hardware("init")` del principio, garantiza que ni
+    // nuestro trabajo ni un trabajo externo a medias dejen bytes huérfanos
+    // en el buffer interno de la impresora.
+    printer.hardware("init");
+  } finally {
+    // ALWAYS release — éxito, excepción, timeout. Esta es la línea que
+    // arregla el bug "DiDi dejó de imprimir" (ver punto 32 de CLAUDE.md):
+    // `device.close()` libera el interface-claim de libusb; sin esto, un
+    // solo trabajo a medias dejaba el puerto bloqueado hasta que se
+    // desconectaba físicamente la impresora.
+    if (printer) {
+      try {
+        await printer.close();
+      } catch (e) {
+        console.warn(`[print-server] [job ${jobId}] printer.close() failed:`, e);
+      }
+    }
+    if (device) {
+      try {
+        await new Promise((resolve) => device.close(() => resolve(undefined)));
+      } catch (e) {
+        console.warn(`[print-server] [job ${jobId}] device.close() failed:`, e);
+      }
+    }
   }
-});
+}
 
 /**
  * POST /preview-receipt
@@ -445,7 +643,20 @@ function buildReceiptHtml(data, logoDataUri) {
         }.`
       : "";
 
-  const itemRows = items
+  // Misma normalización tolerante que la impresión real (ver `safeItems` en
+  // `runPrintJob`): un item con campos faltantes se previsualiza con
+  // defaults en vez de fallar el render. El validador ya garantizó que
+  // `subtotal`/`total` a nivel de venta son números legibles.
+  const safeItems = items.map((it) => ({
+    name: typeof it?.name === "string" ? it.name : "Producto",
+    quantity: toSafeNumber(it?.quantity) ?? 0,
+    price: toSafeNumber(it?.price) ?? 0,
+    subtotal: toSafeNumber(it?.subtotal) ?? 0,
+  }));
+  const safeSubtotal = toSafeNumber(subtotal) ?? 0;
+  const safeTotal = toSafeNumber(total) ?? 0;
+
+  const itemRows = safeItems
     .map(
       (item) => `<div class="row">
         <span style="flex:${ITEM_COL_WIDTHS[0]}">${escapeHtml(item.name)}</span>
@@ -500,8 +711,8 @@ function buildReceiptHtml(data, logoDataUri) {
     </div>
     ${itemRows}
     <hr class="sep" />
-    ${twoColRow("Subtotal", money(subtotal))}
-    ${twoColRow("Total", money(total), true)}
+    ${twoColRow("Subtotal", money(safeSubtotal))}
+    ${twoColRow("Total", money(safeTotal), true)}
     <hr class="sep-solid" />
     ${
       showDianBlock
@@ -522,6 +733,18 @@ function buildReceiptHtml(data, logoDataUri) {
 </body>
 </html>`;
 }
+
+// GET /health — probe liviano (no toca el USB ni la cola): útil para un
+// monitor externo (UptimeRobot, etc.) y para confirmar que no hay jobs
+// atascados. Mismo patrón que `GET /health` del backend (punto 58 del
+// CLAUDE.md raíz).
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    queueDepth: printQueue.queue.length,
+    runningJob: !!printQueue.activeJob,
+  });
+});
 
 // Solo loopback — ver "Aislamiento del servicio" arriba.
 app.listen(PORT, HOST, () => {
